@@ -1,4 +1,6 @@
 """Proxy executor that mirrors TaskExecutor API via IPC."""
+from queue import Empty
+
 import numpy as np
 from multiprocessing import shared_memory
 from threading import Event
@@ -199,19 +201,29 @@ class ProxyExecutor:
         msg = IPCMessage.request(op, **kwargs)
         self._request_queue.put(msg.to_dict())
         while True:
-            resp_dict = self._response_queue.get(timeout=RESPONSE_TIMEOUT)
+            try:
+                resp_dict = self._response_queue.get(timeout=RESPONSE_TIMEOUT)
+            except Empty:
+                raise TimeoutError(
+                    f"No response for '{op}' after {RESPONSE_TIMEOUT}s")
             resp = IPCMessage.from_dict(resp_dict)
             if resp.id == msg.id:
                 if resp.error:
                     raise Exception(resp.error)
                 return resp.result
+            # Not our response — put it back for another caller
+            self._response_queue.put(resp_dict)
 
     def _get_frame(self):
         """Get frame from shared memory."""
         result = self._call(OP_GET_FRAME)
         if result and self._shm:
             h, w, c = result["height"], result["width"], result["channels"]
-            arr = np.frombuffer(self._shm.buf[:h * w * c], dtype=np.uint8)
+            expected = h * w * c
+            if expected > self._shm_size:
+                raise ValueError(
+                    f"Frame too large for shared memory: {expected} > {self._shm_size}")
+            arr = np.frombuffer(self._shm.buf[:expected], dtype=np.uint8)
             return arr.reshape((h, w, c))
         return None
 
@@ -236,6 +248,24 @@ class ProxyExecutor:
     def start(self):
         self.paused = False
         return self._call("start")
+
+    def wait_condition(self, condition, time_out=0, pre_action=None,
+                       post_action=None, settle_time=-1,
+                       raise_if_not_found=False):
+        return self._call("wait_condition", condition=condition,
+                          time_out=time_out, settle_time=settle_time,
+                          raise_if_not_found=raise_if_not_found)
+
+    def wait_scene(self, scene_type, time_out=0, pre_action=None,
+                   post_action=None):
+        return self._call("wait_scene", scene_type=scene_type,
+                          time_out=time_out)
+
+    def ocr_lib(self, name="default"):
+        return self._call("ocr_lib", name=name)
+
+    def get_task_by_class(self, cls):
+        return self._call(OP_GET_TASK_BY_CLASS, cls=cls)
 
     # GUI proxies
     def emit_draw_box(self, name, boxes, color, frame=None, debug=True):
