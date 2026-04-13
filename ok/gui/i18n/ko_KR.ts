@@ -1334,6 +1334,14 @@
             <source>None</source>
             <translation>없음</translation>
         </message>
+        <message>
+            <source>Target window active: Recording resumed</source>
+            <translation type="unfinished" />
+        </message>
+        <message>
+            <source>Target window inactive: Recording paused</source>
+            <translation type="unfinished" />
+        </message>
     </context>
     <context>
         <name>ScheduleTaskTable</name>
@@ -2311,6 +2319,30 @@
             <source>Import failed</source>
             <translation>가져오기 실패</translation>
         </message>
+        <message>
+            <source>No loop</source>
+            <translation>반복 없음</translation>
+        </message>
+        <message>
+            <source>Loop x times</source>
+            <translation>x번 반복</translation>
+        </message>
+        <message>
+            <source>Loop infinitely</source>
+            <translation>무한 반복</translation>
+        </message>
+        <message>
+            <source>OK</source>
+            <translation>확인</translation>
+        </message>
+        <message>
+            <source>Cancel</source>
+            <translation>취소</translation>
+        </message>
+        <message>
+            <source>Recording will start when window '{hwnd_name}' becomes active.</source>
+            <translation>창 '{hwnd_name}'이(가) 활성화되면 녹화가 시작됩니다.</translation>
+        </message>
     </context>
     <context>
         <name>CreateTaskDialog</name>
@@ -2537,7 +2569,7 @@
         <name>Task</name>
         <message>
             <source>NPU inferring Error, you might need to update the Intel NPU driver!</source>
-            <translation type="unfinished" />
+            <translation>NPU 추론 오류, Intel NPU 드라이버를 업데이트해야 할 수 있습니다!</translation>
         </message>
     </context>
 </TS>
