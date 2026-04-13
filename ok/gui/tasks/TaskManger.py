@@ -1,4 +1,5 @@
 import ast
+import atexit
 import glob
 import hashlib
 import importlib
@@ -57,6 +58,8 @@ class TaskManager:
             except Exception as e:
                 logger.error(f"Failed to spawn sandbox: {e}")
                 self._sandbox_runner = None
+        if self._sandbox_runner:
+            atexit.register(self.cleanup)
         if self.debug or self.custom_tasks_enabled:
             self._init_debug_file_watcher()
 

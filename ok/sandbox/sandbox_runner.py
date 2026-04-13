@@ -3,6 +3,7 @@ import ast
 import builtins
 import importlib
 import importlib.util
+import logging
 import os
 import sys
 import threading
@@ -15,6 +16,8 @@ from ok.sandbox.ipc_protocol import (
     CMD_LOAD_SCRIPT, CMD_UNLOAD_SCRIPT, CMD_SHUTDOWN,
 )
 
+logger = logging.getLogger(__name__)
+
 # --- Security: Builtin Restriction ---
 
 BLOCKED_IMPORTS = frozenset({
@@ -23,6 +26,17 @@ BLOCKED_IMPORTS = frozenset({
     "multiprocessing", "pickle", "shelve", "marshal",
     "importlib", "sys", "builtins",
 })
+
+# Modules that the sandbox infrastructure needs even though their
+# top-level package may appear in BLOCKED_IMPORTS (e.g. "os" blocks
+# the stdlib module but we must not nuke "ok.sandbox.*" entries).
+_SANDBOX_MODULE_PREFIXES = (
+    "ok.sandbox",
+    "ok.feature",
+    "ok.util.logger",
+    "multiprocessing",       # needed for Queue / shared_memory in child
+    "numpy",                 # needed by ProxyExecutor for frame data
+)
 
 SAFE_BUILTINS = frozenset({
     "print", "len", "range", "int", "float", "str", "bool", "list", "dict",
@@ -58,17 +72,39 @@ def create_restricted_builtins():
     return safe
 
 
+def _clear_dangerous_modules():
+    """Remove dangerous modules from sys.modules so user scripts cannot reach them."""
+    to_delete = []
+    for mod_name in list(sys.modules.keys()):
+        root = mod_name.split(".")[0]
+        if root in BLOCKED_IMPORTS:
+            # Keep modules required by the sandbox infrastructure itself
+            if any(mod_name == p or mod_name.startswith(p + ".")
+                   for p in _SANDBOX_MODULE_PREFIXES):
+                continue
+            to_delete.append(mod_name)
+    for mod_name in to_delete:
+        del sys.modules[mod_name]
+
+
 # --- Sandbox Child Process ---
 
-def sandbox_main(request_queue, response_queue, shm_name, shm_size, task_folder):
+def sandbox_main(command_queue, reply_queue, shm_name, shm_size, task_folder):
     """
     Entry point for the sandbox child process.
     Sets up restrictions, creates ProxyExecutor, loads user scripts.
+
+    Queues are named from the child's perspective:
+    - command_queue: receives commands FROM the host
+    - reply_queue: sends replies TO the host
     """
     from ok.sandbox.proxy_executor import ProxyExecutor
     from ok.feature.Box import Box
 
-    executor = ProxyExecutor(request_queue, response_queue, shm_name, shm_size)
+    executor = ProxyExecutor(command_queue, reply_queue, shm_name, shm_size)
+
+    # Remove dangerous modules so user scripts cannot access them
+    _clear_dangerous_modules()
 
     # Track loaded tasks: {task_id: task_info}
     tasks = {}
@@ -121,62 +157,76 @@ def sandbox_main(request_queue, response_queue, shm_name, shm_size, task_folder)
     # Main command loop
     while True:
         try:
-            cmd_dict = response_queue.get(timeout=2)
+            cmd_dict = command_queue.get(timeout=2)
             cmd = IPCMessage.from_dict(cmd_dict)
         except Exception:
             continue
 
-        if cmd.op == CMD_SHUTDOWN:
-            break
-        elif cmd.op == CMD_LOAD_SCRIPT:
-            tid, err = load_script(cmd.kwargs["file_path"], cmd.kwargs.get("task_id"))
-            resp = IPCMessage.response(cmd.id, cmd.op,
-                                       result=tid if tid else None,
-                                       error=err)
-            request_queue.put(resp.to_dict())
-        elif cmd.op == CMD_UNLOAD_SCRIPT:
-            tasks.pop(cmd.kwargs.get("task_id"), None)
-            resp = IPCMessage.response(cmd.id, cmd.op, result=True)
-            request_queue.put(resp.to_dict())
-        elif cmd.op == CMD_RUN:
-            tid = cmd.kwargs.get("task_id")
-            task_info = tasks.get(tid)
-            if task_info:
-                try:
-                    task_info["instance"].run()
+        try:
+            if cmd.op == CMD_SHUTDOWN:
+                break
+            elif cmd.op == CMD_LOAD_SCRIPT:
+                tid, err = load_script(cmd.kwargs["file_path"], cmd.kwargs.get("task_id"))
+                resp = IPCMessage.response(cmd.id, cmd.op,
+                                           result=tid if tid else None,
+                                           error=err)
+                reply_queue.put(resp.to_dict())
+            elif cmd.op == CMD_UNLOAD_SCRIPT:
+                tasks.pop(cmd.kwargs.get("task_id"), None)
+                resp = IPCMessage.response(cmd.id, cmd.op, result=True)
+                reply_queue.put(resp.to_dict())
+            elif cmd.op == CMD_RUN:
+                tid = cmd.kwargs.get("task_id")
+                task_info = tasks.get(tid)
+                if task_info:
+                    try:
+                        task_info["instance"].run()
+                        resp = IPCMessage.response(cmd.id, cmd.op, result=True)
+                    except Exception:
+                        resp = IPCMessage.response(cmd.id, cmd.op,
+                                                   error=traceback.format_exc())
+                    reply_queue.put(resp.to_dict())
+                else:
+                    resp = IPCMessage.response(cmd.id, cmd.op, error=f"Task {tid} not found")
+                    reply_queue.put(resp.to_dict())
+            elif cmd.op == CMD_TRIGGER:
+                tid = cmd.kwargs.get("task_id")
+                task_info = tasks.get(tid)
+                if task_info:
+                    try:
+                        result = task_info["instance"].trigger()
+                        resp = IPCMessage.response(cmd.id, cmd.op, result=result)
+                    except Exception:
+                        resp = IPCMessage.response(cmd.id, cmd.op,
+                                                   error=traceback.format_exc())
+                    reply_queue.put(resp.to_dict())
+            elif cmd.op == CMD_ENABLE:
+                tid = cmd.kwargs.get("task_id")
+                task_info = tasks.get(tid)
+                if task_info and hasattr(task_info["instance"], "enable"):
+                    task_info["instance"].enable()
                     resp = IPCMessage.response(cmd.id, cmd.op, result=True)
-                except Exception:
+                else:
                     resp = IPCMessage.response(cmd.id, cmd.op,
-                                               error=traceback.format_exc())
-                request_queue.put(resp.to_dict())
-            else:
-                resp = IPCMessage.response(cmd.id, cmd.op, error=f"Task {tid} not found")
-                request_queue.put(resp.to_dict())
-        elif cmd.op == CMD_TRIGGER:
-            tid = cmd.kwargs.get("task_id")
-            task_info = tasks.get(tid)
-            if task_info:
-                try:
-                    result = task_info["instance"].trigger()
-                    resp = IPCMessage.response(cmd.id, cmd.op, result=result)
-                except Exception:
+                                               error=f"Task {tid} not found or has no enable()")
+                reply_queue.put(resp.to_dict())
+            elif cmd.op == CMD_DISABLE:
+                tid = cmd.kwargs.get("task_id")
+                task_info = tasks.get(tid)
+                if task_info and hasattr(task_info["instance"], "disable"):
+                    task_info["instance"].disable()
+                    resp = IPCMessage.response(cmd.id, cmd.op, result=True)
+                else:
                     resp = IPCMessage.response(cmd.id, cmd.op,
-                                               error=traceback.format_exc())
-                request_queue.put(resp.to_dict())
-        elif cmd.op == CMD_ENABLE:
-            tid = cmd.kwargs.get("task_id")
-            task_info = tasks.get(tid)
-            if task_info and hasattr(task_info["instance"], "enable"):
-                task_info["instance"].enable()
-                resp = IPCMessage.response(cmd.id, cmd.op, result=True)
-                request_queue.put(resp.to_dict())
-        elif cmd.op == CMD_DISABLE:
-            tid = cmd.kwargs.get("task_id")
-            task_info = tasks.get(tid)
-            if task_info and hasattr(task_info["instance"], "disable"):
-                task_info["instance"].disable()
-                resp = IPCMessage.response(cmd.id, cmd.op, result=True)
-                request_queue.put(resp.to_dict())
+                                               error=f"Task {tid} not found or has no disable()")
+                reply_queue.put(resp.to_dict())
+        except Exception as e:
+            logger.error(f"Sandbox child error handling {cmd.op}: {e}")
+            try:
+                resp = IPCMessage.response(cmd.id, cmd.op, error=str(e))
+                reply_queue.put(resp.to_dict())
+            except Exception:
+                logger.error(f"Sandbox child failed to send error reply: {e}")
 
 
 # --- Host-side Dispatch ---
@@ -288,6 +338,7 @@ class IPCThread(threading.Thread):
                 resp = dispatch_request(msg, self._task_executor)
                 self._response_queue.put(resp.to_dict())
             except Exception:
+                # queue.Empty on timeout is expected; log real errors
                 continue
 
     def stop(self):
@@ -299,22 +350,22 @@ class IPCThread(threading.Thread):
 class SandboxRunner:
     """Host-side manager for the sandbox process."""
 
-    def __init__(self, task_executor, task_folder=None):
+    def __init__(self, task_executor, task_folder=None, shm_size=None):
         self.task_executor = task_executor
         self.task_folder = task_folder
         self._process = None
-        self._request_queue = None
-        self._response_queue = None
+        self._reply_queue = None     # child puts replies here, host reads
+        self._command_queue = None    # host puts commands here, child reads
         self._shm = None
         self._shm_name = None
-        self._shm_size = 1920 * 1080 * 3
+        self._shm_size = shm_size or 1920 * 1080 * 4
         self._ipc_thread = None
         self._running = False
 
     def spawn(self):
         """Start the sandbox child process."""
-        self._request_queue = Queue()
-        self._response_queue = Queue()
+        self._command_queue = Queue()
+        self._reply_queue = Queue()
         try:
             self._shm = shared_memory.SharedMemory(
                 name=f"ok_sandbox_{os.getpid()}",
@@ -328,15 +379,16 @@ class SandboxRunner:
 
         self._process = Process(
             target=sandbox_main,
-            args=(self._request_queue, self._response_queue,
+            args=(self._command_queue, self._reply_queue,
                   self._shm_name, self._shm_size, self.task_folder),
             daemon=True,
         )
         self._process.start()
 
-        # Start IPC dispatch thread
+        # Start IPC dispatch thread — reads from _reply_queue (child requests)
+        # and writes to _command_queue (responses back to child).
         self._ipc_thread = IPCThread(
-            self._request_queue, self._response_queue, self.task_executor)
+            self._reply_queue, self._command_queue, self.task_executor)
         self._ipc_thread.start()
         self._running = True
 
@@ -344,26 +396,32 @@ class SandboxRunner:
         """Load a script into the sandbox."""
         cmd = IPCMessage.command(CMD_LOAD_SCRIPT,
                                  file_path=file_path, task_id=task_id)
-        self._response_queue.put(cmd.to_dict())
-        resp_dict = self._request_queue.get(timeout=10)
+        self._command_queue.put(cmd.to_dict())
+        resp_dict = self._reply_queue.get(timeout=10)
         resp = IPCMessage.from_dict(resp_dict)
         return resp.result, resp.error
 
     def run_task(self, task_id):
         """Run a task in the sandbox."""
         cmd = IPCMessage.command(CMD_RUN, task_id=task_id)
-        self._response_queue.put(cmd.to_dict())
-        resp_dict = self._request_queue.get(timeout=300)
+        self._command_queue.put(cmd.to_dict())
+        resp_dict = self._reply_queue.get(timeout=300)
         resp = IPCMessage.from_dict(resp_dict)
         return resp.result, resp.error
 
     def enable_task(self, task_id):
         cmd = IPCMessage.command(CMD_ENABLE, task_id=task_id)
-        self._response_queue.put(cmd.to_dict())
+        self._command_queue.put(cmd.to_dict())
+        resp_dict = self._reply_queue.get(timeout=10)
+        resp = IPCMessage.from_dict(resp_dict)
+        return resp.result, resp.error
 
     def disable_task(self, task_id):
         cmd = IPCMessage.command(CMD_DISABLE, task_id=task_id)
-        self._response_queue.put(cmd.to_dict())
+        self._command_queue.put(cmd.to_dict())
+        resp_dict = self._reply_queue.get(timeout=10)
+        resp = IPCMessage.from_dict(resp_dict)
+        return resp.result, resp.error
 
     def shutdown(self):
         """Gracefully shut down the sandbox process."""
@@ -372,7 +430,7 @@ class SandboxRunner:
             self._ipc_thread.stop()
         if self._process and self._process.is_alive():
             cmd = IPCMessage.command(CMD_SHUTDOWN)
-            self._response_queue.put(cmd.to_dict())
+            self._command_queue.put(cmd.to_dict())
             self._process.join(timeout=3)
             if self._process.is_alive():
                 self._process.terminate()

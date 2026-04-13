@@ -262,6 +262,19 @@ class TestProxyExecutor(unittest.TestCase):
         executor, _, _ = self._make_executor()
         self.assertTrue(executor.method.connected())
 
+    def test_call_timeout_raises(self):
+        """_call should raise TimeoutError when no response arrives."""
+        import ok.sandbox.proxy_executor as pe_mod
+        original_timeout = pe_mod.RESPONSE_TIMEOUT
+        pe_mod.RESPONSE_TIMEOUT = 0.1
+        try:
+            executor, _, _ = self._make_executor()
+            # No responder thread — nobody will answer
+            with self.assertRaises(TimeoutError):
+                executor.ping()
+        finally:
+            pe_mod.RESPONSE_TIMEOUT = original_timeout
+
 
 if __name__ == "__main__":
     unittest.main()

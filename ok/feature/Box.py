@@ -65,8 +65,12 @@ class Box:
     def from_dict(cls, d):
         if d is None:
             return None
-        return cls(d["x"], d["y"], d["width"], d["height"],
-                   confidence=d.get("confidence", 1.0), name=d.get("name"))
+        try:
+            return cls(d["x"], d["y"], d["width"], d["height"],
+                       confidence=d.get("confidence", 1.0), name=d.get("name"))
+        except (KeyError, TypeError, ValueError) as e:
+            logger.warning(f"Invalid Box dict, returning None: {e}")
+            return None
 
     def __eq__(self, other):
         """
